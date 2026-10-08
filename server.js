@@ -64,11 +64,11 @@ function rateLimit(req, res, next) {
 setInterval(() => { const now = Date.now(); for (const [k, h] of hits) if (now - h.t > WINDOW) hits.delete(k); }, WINDOW).unref();
 
 /* ---------- AI providers ---------- */
-async function askGemini(model, system, message) {
+async function askGemini(model, system, message, maxTokens) {
   const body = {
     systemInstruction: { parts: [{ text: system }] },
     contents: [{ role: "user", parts: [{ text: message }] }],
-    generationConfig: { maxOutputTokens: MAX_TOKENS, temperature: 0.4 },
+    generationConfig: { maxOutputTokens: maxTokens || MAX_TOKENS, temperature: 0.4 },
   };
   // turn off slow "thinking" on flash => much faster answers for school questions
   if (model === "gemini-2.5-flash") body.generationConfig.thinkingConfig = { thinkingBudget: 0 };
@@ -86,14 +86,14 @@ async function askGemini(model, system, message) {
   return text;
 }
 
-async function askGroq(system, message) {
+async function askGroq(system, message, maxTokens) {
   if (!GROQ_API_KEY) throw new Error("no groq key");
   const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${GROQ_API_KEY}` },
     body: JSON.stringify({
       model: GROQ_MODEL,
-      max_tokens: MAX_TOKENS,
+      max_tokens: maxTokens || MAX_TOKENS,
       temperature: 0.4,
       reasoning_effort: "low",
       messages: [{ role: "system", content: system }, { role: "user", content: message }],
@@ -108,27 +108,27 @@ async function askGroq(system, message) {
 }
 
 // Order: fast Gemini flash -> Groq -> other Gemini models. First success wins.
-async function generate({ message, cls, screenContext, systemPrompt }) {
+async function generate({ message, cls, screenContext, systemPrompt, maxTokens }) {
   const base = (systemPrompt && String(systemPrompt).trim()) || DEFAULT_SYSTEM;
   const ctx = [cls ? `Student is in Class ${cls}.` : null, screenContext ? `They are currently on this app screen: ${screenContext}.` : null]
     .filter(Boolean).join(" ");
   const system = `${IDENTITY_RULE}\n\n${base}${ctx ? "\n\n" + ctx : ""}`;
 
   const key = sha(system + "|" + message);
-  const hit = cacheGet(key);
+  const hit = cacheGet(key + "|" + (maxTokens || 0));
   if (hit) return hit;
 
   const steps = [];
-  if (GEMINI_API_KEY) steps.push(() => askGemini(GEMINI_MODELS[0], system, message));
-  if (GROQ_API_KEY) steps.push(() => askGroq(system, message));
-  if (GEMINI_API_KEY) GEMINI_MODELS.slice(1).forEach((m) => steps.push(() => askGemini(m, system, message)));
+  if (GEMINI_API_KEY) steps.push(() => askGemini(GEMINI_MODELS[0], system, message, maxTokens));
+  if (GROQ_API_KEY) steps.push(() => askGroq(system, message, maxTokens));
+  if (GEMINI_API_KEY) GEMINI_MODELS.slice(1).forEach((m) => steps.push(() => askGemini(m, system, message, maxTokens)));
   if (!steps.length) { const e = new Error("no keys"); e.status = 500; throw e; }
 
   let lastErr;
   for (const step of steps) {
     try {
       const reply = await step();
-      cacheSet(key, reply);
+      cacheSet(key + "|" + (maxTokens || 0), reply);
       return reply;
     } catch (e) {
       lastErr = e;
@@ -146,6 +146,7 @@ const readBody = (b = {}) => ({
   cls: b.class ? String(b.class).slice(0, 3) : "",
   screenContext: b.screenContext ? String(b.screenContext).slice(0, 300) : "",
   systemPrompt: b.systemPrompt ? String(b.systemPrompt).slice(0, 3000) : "",
+  maxTokens: Math.min(parseInt(b.maxTokens) || 0, 6000) || undefined,
 });
 
 /* ---------- routes ---------- */
