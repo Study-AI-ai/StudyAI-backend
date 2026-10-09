@@ -19,6 +19,13 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GEMINI_MODELS = String(process.env.GEMINI_MODELS || "gemini-2.5-flash,gemini-flash-latest,gemini-2.5-pro").split(",").map(s => s.trim()).filter(Boolean);
 const GROQ_MODEL = "openai/gpt-oss-120b";
 const MAX_TOKENS = 2048;
+function geminiLimitEnvName(model) {
+  return "GEMINI_RPD_LIMIT_" + model.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
+}
+const GEMINI_MODEL_DAILY_LIMITS = Object.fromEntries(GEMINI_MODELS.map(model => [
+  model,
+  Math.max(0, Number.parseInt(process.env[geminiLimitEnvName(model)] || "0", 10) || 0),
+]));
 
 // Private quota monitor. Gemini remaining is an estimate based on GEMINI_RPD_LIMIT.
 const ADMIN_DASHBOARD_TOKEN = process.env.ADMIN_DASHBOARD_TOKEN || "";
@@ -34,9 +41,20 @@ function blankUsageStats() {
     recentRequests: [], lastAttemptAt: null, lastSuccessAt: null, lastErrorAt: null,
     lastStatus: null, lastError: null, lastModel: null, groqQuota: null };
 }
+function blankModelStats(provider, model) {
+  return { provider, model, requestsToday: 0, successesToday: 0, failuresToday: 0,
+    totalTokensToday: 0, recentRequests: [], lastAttemptAt: null, lastSuccessAt: null,
+    lastErrorAt: null, lastStatus: null, lastError: null, groqQuota: null };
+}
+function ensureModelStats(provider, model) {
+  const key = provider + "|" + model;
+  if (!usageMonitor.modelUsage[key]) usageMonitor.modelUsage[key] = blankModelStats(provider, model);
+  return usageMonitor.modelUsage[key];
+}
 const usageMonitor = {
   dayKey: usageDayKey(), startedAt: new Date().toISOString(),
   providers: { gemini: blankUsageStats(), groq: blankUsageStats() },
+  modelUsage: {},
   lastProvider: null, lastSuccessfulProvider: null, lastActivityAt: null,
 };
 function ensureUsageDay() {
@@ -44,6 +62,7 @@ function ensureUsageDay() {
   if (usageMonitor.dayKey !== day) {
     usageMonitor.dayKey = day;
     usageMonitor.providers = { gemini: blankUsageStats(), groq: blankUsageStats() };
+    usageMonitor.modelUsage = {};
     usageMonitor.lastProvider = null;
     usageMonitor.lastSuccessfulProvider = null;
     usageMonitor.lastActivityAt = null;
@@ -58,9 +77,14 @@ function usageStart(provider, model) {
   p.recentRequests.push(now);
   p.lastAttemptAt = new Date(now).toISOString();
   p.lastModel = model;
+  const m = ensureModelStats(provider, model);
+  m.requestsToday += 1;
+  m.recentRequests = m.recentRequests.filter(t => now - t < 60000);
+  m.recentRequests.push(now);
+  m.lastAttemptAt = p.lastAttemptAt;
   usageMonitor.lastProvider = provider;
   usageMonitor.lastActivityAt = p.lastAttemptAt;
-  return { provider, finished: false };
+  return { provider, model, finished: false };
 }
 function saveGroqQuota(headers) {
   if (!headers) return;
@@ -86,7 +110,16 @@ function usageSuccess(ticket, totalTokens = 0, headers = null) {
   p.lastSuccessAt = new Date().toISOString();
   p.lastStatus = 200;
   p.lastError = null;
-  if (ticket.provider === "groq") saveGroqQuota(headers);
+  const m = ensureModelStats(ticket.provider, ticket.model);
+  m.successesToday += 1;
+  m.totalTokensToday += Math.max(0, Number(totalTokens) || 0);
+  m.lastSuccessAt = p.lastSuccessAt;
+  m.lastStatus = 200;
+  m.lastError = null;
+  if (ticket.provider === "groq") {
+    saveGroqQuota(headers);
+    m.groqQuota = p.groqQuota ? JSON.parse(JSON.stringify(p.groqQuota)) : null;
+  }
   usageMonitor.lastSuccessfulProvider = ticket.provider;
   usageMonitor.lastActivityAt = p.lastSuccessAt;
 }
@@ -99,20 +132,49 @@ function usageFailure(ticket, error, headers = null) {
   p.lastErrorAt = new Date().toISOString();
   p.lastStatus = Number(error && error.status) || 0;
   p.lastError = String((error && error.data && error.data.error && error.data.error.message) || (error && error.message) || "Unknown API error").slice(0, 220);
-  if (ticket.provider === "groq") saveGroqQuota(headers);
+  const m = ensureModelStats(ticket.provider, ticket.model);
+  m.failuresToday += 1;
+  m.lastErrorAt = p.lastErrorAt;
+  m.lastStatus = p.lastStatus;
+  m.lastError = p.lastError;
+  if (ticket.provider === "groq") {
+    saveGroqQuota(headers);
+    m.groqQuota = p.groqQuota ? JSON.parse(JSON.stringify(p.groqQuota)) : null;
+  }
   usageMonitor.lastActivityAt = p.lastErrorAt;
 }
 function usageSnapshot() {
   ensureUsageDay();
   const now = Date.now();
+  // Include every configured model even before it has received its first request.
+  for (const model of GEMINI_MODELS) ensureModelStats("gemini", model);
+  ensureModelStats("groq", GROQ_MODEL);
   const copy = JSON.parse(JSON.stringify(usageMonitor));
   for (const name of ["gemini", "groq"]) {
     copy.providers[name].requestsLastMinute = usageMonitor.providers[name].recentRequests.filter(t => now - t < 60000).length;
     delete copy.providers[name].recentRequests;
   }
+  copy.models = Object.values(copy.modelUsage).map(m => {
+    m.requestsLastMinute = (m.recentRequests || []).filter(t => now - t < 60000).length;
+    delete m.recentRequests;
+    if (m.provider === "gemini") {
+      m.dailyLimit = GEMINI_MODEL_DAILY_LIMITS[m.model] || null;
+      m.remaining = m.dailyLimit ? Math.max(0, m.dailyLimit - m.requestsToday) : null;
+      m.remainingIsEstimate = true;
+    } else {
+      m.dailyLimit = m.groqQuota && m.groqQuota.limitRequests != null ? m.groqQuota.limitRequests : null;
+      m.remaining = m.groqQuota && m.groqQuota.remainingRequests != null ? m.groqQuota.remainingRequests : null;
+      m.remainingIsEstimate = false;
+    }
+    return m;
+  });
+  delete copy.modelUsage;
   copy.config = {
     geminiModels: GEMINI_MODELS, groqModel: GROQ_MODEL,
-    geminiDailyLimit: GEMINI_RPD_LIMIT || null, persistenceEnabled: false,
+    geminiDailyLimit: GEMINI_RPD_LIMIT || null,
+    geminiModelDailyLimits: GEMINI_MODEL_DAILY_LIMITS,
+    geminiModelLimitEnvNames: Object.fromEntries(GEMINI_MODELS.map(model => [model, geminiLimitEnvName(model)])),
+    persistenceEnabled: false,
   };
   copy.asOf = new Date().toISOString();
   return copy;
